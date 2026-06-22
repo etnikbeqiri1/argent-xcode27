@@ -176,10 +176,14 @@ export async function openMoqClientFromInfo(info: MoqInfo): Promise<MoqClient> {
     async close(): Promise<void> {
       try {
         controlBroadcast.close();
-      } catch {}
+      } catch {
+        // Best-effort close — already-closed transports are not an error here.
+      }
       try {
         established.close();
-      } catch {}
+      } catch {
+        // Best-effort close — already-closed transports are not an error here.
+      }
     },
   };
 

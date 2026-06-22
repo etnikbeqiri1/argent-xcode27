@@ -17,7 +17,10 @@
  *   argent tools                  List tools exposed by the tool-server
  *   argent tools describe <name>  Show one tool's flags
  *   argent run <tool> [flags]     Invoke a tool by name
+ *   argent server start [flags]   Spawn a long-lived tool-server (foreground by default)
  *   argent server status|stop|logs   Manage the shared tool-server
+ *   argent link [flags]           Route client requests to a remote tool-server
+ *   argent unlink                 Remove the persisted remote link
  *   argent enable <flag>          Enable a feature flag (global by default)
  *   argent disable <flag>         Disable a feature flag (global by default)
  *   argent flags                  Show current feature-flag state
@@ -66,10 +69,13 @@ Commands:
   remove      Alias for uninstall
   tools       List tools exposed by the tool-server
   run         Invoke a tool by name (use \`argent run <tool> --help\` for flags)
-  server      Manage the shared tool-server (status / stop / logs)
+  server      Manage the shared tool-server (start / status / stop / logs)
+  link        Route client requests to a remote tool-server
+  unlink      Remove the persisted remote tool-server link
   enable      Enable a feature flag (global by default, --scope project for project)
   disable     Disable a feature flag (global by default, --scope project for project)
   flags       Show current feature-flag state
+  telemetry   Manage anonymous opt-out telemetry (status / enable / disable)
 
 Options:
   --help, -h     Show this help message
@@ -85,15 +91,12 @@ Package: ${PACKAGE_NAME}
 // scripts/bundle-tools.cjs and shipped alongside this dispatcher in dist/.
 // Typed against the workspace packages so calls are still checked.
 async function loadInstaller(): Promise<typeof Installer> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (await import("./installer.mjs" as any)) as typeof Installer;
 }
 async function loadMcp(): Promise<typeof Mcp> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (await import("./mcp-server.mjs" as any)) as typeof Mcp;
 }
 async function loadCli(): Promise<typeof Cli> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (await import("./cli-cmds.mjs" as any)) as typeof Cli;
 }
 
@@ -114,13 +117,19 @@ async function main(): Promise<void> {
     case "run":
       return (await loadCli()).run(rest, { paths: BUNDLED_RUNTIME_PATHS });
     case "server":
-      return (await loadCli()).server(rest);
+      return (await loadCli()).server(rest, { paths: BUNDLED_RUNTIME_PATHS });
+    case "link":
+      return (await loadCli()).link(rest);
+    case "unlink":
+      return (await loadCli()).unlink(rest);
     case "enable":
       return (await loadCli()).enable(rest);
     case "disable":
       return (await loadCli()).disable(rest);
     case "flags":
       return (await loadCli()).flags(rest);
+    case "telemetry":
+      return (await loadCli()).telemetry(rest);
     case "--version":
     case "-v":
       console.log(getInstalledVersion() ?? "unknown");

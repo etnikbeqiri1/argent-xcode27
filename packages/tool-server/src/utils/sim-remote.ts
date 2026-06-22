@@ -40,7 +40,7 @@ async function run(args: string[], options?: SimRemoteOptions): Promise<{ stdout
     const stderr = (e.stderr ?? "").trim();
     const stdout = (e.stdout ?? "").trim();
     const suffix = stderr || stdout || e.message;
-    throw new Error(`sim-remote ${args.join(" ")} failed: ${suffix}`);
+    throw new Error(`sim-remote ${args.join(" ")} failed: ${suffix}`, { cause: err });
   }
 }
 
@@ -68,7 +68,8 @@ export async function simctlListDevices(): Promise<SimRemoteListDevicesResult> {
     return JSON.parse(stdout) as SimRemoteListDevicesResult;
   } catch (err) {
     throw new Error(
-      `sim-remote simctl list devices --json returned non-JSON output: ${(err as Error).message}`
+      `sim-remote simctl list devices --json returned non-JSON output: ${(err as Error).message}`,
+      { cause: err }
     );
   }
 }
@@ -210,6 +211,8 @@ export async function moqInfo(udid: string): Promise<MoqInfo> {
   try {
     return JSON.parse(stdout) as MoqInfo;
   } catch (err) {
-    throw new Error(`sim-remote moq-info returned non-JSON output: ${(err as Error).message}`);
+    throw new Error(`sim-remote moq-info returned non-JSON output: ${(err as Error).message}`, {
+      cause: err,
+    });
   }
 }

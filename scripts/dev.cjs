@@ -61,60 +61,69 @@ async function waitForHttp(url, timeoutMs = 20_000) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(1000) });
       if (res.ok) return true;
-    } catch {}
+    } catch {
+      /* not up yet — keep polling until the deadline */
+    }
     await new Promise((r) => setTimeout(r, 400));
   }
   return false;
 }
 
-// ── Step 1: Build native devtools dylibs ─────────────────────────────────────
+// ── Step 1: Build native devtools dylibs (macOS only) ───────────────────────
 
-const DYLIBS_DIR = path.join(NATIVE_DEVTOOLS_PKG, "dylibs");
-const DYLIBS_EXIST = fs.existsSync(path.join(DYLIBS_DIR, "libNativeDevtoolsIos.dylib"));
-const PRIVATE_NATIVE_DEVTOOLS_SRC = path.join(
-  ROOT,
-  "packages",
-  "argent-private",
-  "packages",
-  "native-devtools-ios",
-  "Sources",
-  "NativeDevtoolsIos"
-);
+// Dylibs are macOS-only at runtime (DYLD_INSERT_LIBRARIES into iOS Simulator)
+// and macOS-only at build time (Xcode). Skip on Linux/Windows so a contributor
+// without `argent-private` SSH access can still run `npm run dev`.
+if (process.platform === "darwin") {
+  const DYLIBS_DIR = path.join(NATIVE_DEVTOOLS_PKG, "dylibs");
+  const DYLIBS_EXIST = fs.existsSync(path.join(DYLIBS_DIR, "libNativeDevtoolsIos.dylib"));
+  const PRIVATE_NATIVE_DEVTOOLS_SRC = path.join(
+    ROOT,
+    "packages",
+    "argent-private",
+    "packages",
+    "native-devtools-ios",
+    "Sources",
+    "NativeDevtoolsIos"
+  );
 
-// Try to init the submodule and rebuild. Failure is non-fatal if pre-built
-// dylibs are already present — developers without argent-private access can
-// still work on Argent using the committed binaries.
-let submoduleReady = false;
-try {
-  // Preserve an existing argent-private checkout so local branch switches
-  // are not reset back to the superproject's recorded gitlink on every dev run.
-  if (!fs.existsSync(PRIVATE_NATIVE_DEVTOOLS_SRC)) {
-    execSync("git submodule update --init packages/argent-private", {
-      cwd: ROOT,
-      stdio: "pipe",
+  // Try to init the submodule and rebuild. Failure is non-fatal if pre-built
+  // dylibs are already present — developers without argent-private access can
+  // still work on Argent using the committed binaries.
+  let submoduleReady = false;
+  try {
+    // Preserve an existing argent-private checkout so local branch switches
+    // are not reset back to the superproject's recorded gitlink on every dev run.
+    if (!fs.existsSync(PRIVATE_NATIVE_DEVTOOLS_SRC)) {
+      execSync("git submodule update --init packages/argent-private", {
+        cwd: ROOT,
+        stdio: "pipe",
+      });
+    }
+    submoduleReady = true;
+  } catch {
+    if (DYLIBS_EXIST) {
+      console.warn("⚠ argent-private submodule unavailable — using pre-built dylibs\n");
+    } else {
+      console.error("✗ argent-private submodule unavailable and no pre-built dylibs found.");
+      console.error("  Grant SSH access to github.com/software-mansion-labs/argent-private");
+      console.error(
+        "  or obtain pre-built dylibs and place them in packages/native-devtools-ios/dylibs/"
+      );
+      process.exit(1);
+    }
+  }
+
+  if (submoduleReady) {
+    console.log("Building native devtools dylibs...");
+    execSync("bash scripts/build.sh dev", {
+      cwd: NATIVE_DEVTOOLS_PKG,
+      stdio: "inherit",
     });
+    console.log("✓ Native devtools dylibs built\n");
   }
-  submoduleReady = true;
-} catch {
-  if (DYLIBS_EXIST) {
-    console.warn("⚠ argent-private submodule unavailable — using pre-built dylibs\n");
-  } else {
-    console.error("✗ argent-private submodule unavailable and no pre-built dylibs found.");
-    console.error("  Grant SSH access to github.com/software-mansion-labs/argent-private");
-    console.error(
-      "  or obtain pre-built dylibs and place them in packages/native-devtools-ios/dylibs/"
-    );
-    process.exit(1);
-  }
-}
-
-if (submoduleReady) {
-  console.log("Building native devtools dylibs...");
-  execSync("bash scripts/build.sh dev", {
-    cwd: NATIVE_DEVTOOLS_PKG,
-    stdio: "inherit",
-  });
-  console.log("✓ Native devtools dylibs built\n");
+} else {
+  console.log(`⊘ Skipping native devtools dylibs build (macOS-only on ${process.platform})\n`);
 }
 
 // ── Step 2: Build MCP TypeScript ─────────────────────────────────────────────
@@ -128,16 +137,27 @@ console.log("✓ Dispatcher TypeScript built\n");
 
 // ── Step 3: Set up packages/argent/bin/ and skills/rules/agents ──────────────
 
-const BIN_DIR = path.join(ARGENT_PKG, "bin");
-const BIN_SRC = path.join(NATIVE_DEVTOOLS_PKG, "bin", "simulator-server");
+// Copy the simulator-server binary for the current host platform into the
+// platform-keyed subdir the runtime resolver looks at. Mirrors bundle-tools.cjs
+// but only for the current host's key — dev iterations don't need every
+// host's binary alongside. The key mirrors hostPlatformKey() in
+// @argent/native-devtools-ios (process.platform, except "linux-arm64" on
+// arm64 Linux).
+const HOST_PLATFORM_KEY =
+  process.platform === "linux" && process.arch === "arm64" ? "linux-arm64" : process.platform;
+const BIN_DIR = path.join(ARGENT_PKG, "bin", HOST_PLATFORM_KEY);
+const BIN_SRC = path.join(NATIVE_DEVTOOLS_PKG, "bin", HOST_PLATFORM_KEY, "simulator-server");
 const BIN_DEST = path.join(BIN_DIR, "simulator-server");
 fs.mkdirSync(BIN_DIR, { recursive: true });
 if (fs.existsSync(BIN_SRC)) {
   fs.copyFileSync(BIN_SRC, BIN_DEST);
   fs.chmodSync(BIN_DEST, 0o755);
-  console.log("✓ Copied simulator-server binary");
+  console.log(`✓ Copied simulator-server binary (${HOST_PLATFORM_KEY})`);
 } else {
-  console.warn("⚠ simulator-server binary not found — gestures won't work");
+  console.warn(
+    `⚠ simulator-server binary not found at ${BIN_SRC} — gestures won't work. ` +
+      `Run: bash scripts/download-simulator-server.sh`
+  );
 }
 
 for (const [srcName, destName] of [
@@ -182,7 +202,9 @@ function restoreMcpEntry(configPath, originalEntry, existedBefore) {
   if (!existedBefore && Object.keys(config).length === 0) {
     try {
       fs.unlinkSync(configPath);
-    } catch {}
+    } catch {
+      /* file already absent — nothing to remove */
+    }
     return;
   }
 
@@ -206,7 +228,12 @@ const devMcpEntry = {
   type: "stdio",
   command: "node",
   args: [LOCAL_MCP_ENTRY, "mcp"],
-  env: { ARGENT_MCP_LOG: LOG_FILE },
+  // Point the dev MCP straight at the running dev tool-server. Without this
+  // it calls ensureToolsServer(), which now treats the tokenless dev state
+  // as stale, SIGTERMs the dev server and tries to spawn the throwing dev
+  // stub — breaking `npm run dev`. The dev server runs auth-disabled, so no
+  // ARGENT_AUTH_TOKEN is needed here.
+  env: { ARGENT_MCP_LOG: LOG_FILE, ARGENT_TOOLS_URL: `http://127.0.0.1:${PORT}` },
 };
 
 if (!claudeConfig.mcpServers) claudeConfig.mcpServers = {};
@@ -219,7 +246,9 @@ if (shouldPatchCursor) {
   cursorConfig.mcpServers.argent = {
     command: "node",
     args: [LOCAL_MCP_ENTRY, "mcp"],
-    env: { ARGENT_MCP_LOG: LOG_FILE },
+    // Same env as the Claude entry (incl. ARGENT_TOOLS_URL) so Cursor's dev
+    // MCP also reuses the running dev tool-server instead of killing it.
+    env: devMcpEntry.env,
   };
   writeJson(CURSOR_MCP_JSON, cursorConfig);
   console.log(`✓ Patched ~/.cursor/mcp.json → node ${LOCAL_MCP_ENTRY} mcp\n`);
@@ -240,7 +269,9 @@ function cleanup() {
   }
   try {
     fs.unlinkSync(STATE_FILE);
-  } catch {}
+  } catch {
+    /* state file already absent — nothing to remove */
+  }
 
   // Restore editor configs
   restoreMcpEntry(CLAUDE_JSON, originalArgentEntry, claudeConfigExists);
@@ -274,7 +305,9 @@ async function main() {
   }
   try {
     fs.unlinkSync(STATE_FILE);
-  } catch {}
+  } catch {
+    /* state file already absent — nothing to remove */
+  }
 
   // ── Step 6: Start tool-server from source ──────────────────────────────────
 

@@ -1,5 +1,6 @@
+import { FAILURE_CODES, FailureError } from "@argent/registry";
 import type { PlatformImpl } from "../../../utils/cross-platform-tool";
-import { adbShell } from "../../../utils/adb";
+import { adbShell, shellQuote } from "../../../utils/adb";
 import type { LaunchAppAndroidServices, LaunchAppParams, LaunchAppResult } from "../types";
 
 // `am start -W` always prints a `Status:` banner. A positive-match check on
@@ -9,7 +10,12 @@ import type { LaunchAppAndroidServices, LaunchAppParams, LaunchAppResult } from 
 // false-succeeded on `Status: null` when the activity failed in onCreate.
 export function assertAmStartOk(out: string): void {
   if (!/Status:\s*ok/i.test(out)) {
-    throw new Error(`am start failed: ${out.trim()}`);
+    throw new FailureError(`am start failed: ${out.trim()}`, {
+      error_code: FAILURE_CODES.ANDROID_LAUNCH_AM_START_FAILED,
+      failure_stage: "android_launch_am_start",
+      failure_area: "tool_server",
+      error_kind: "subprocess",
+    });
   }
   // "Warning: Activity not started, its current task has been brought to the
   // front" also comes with Status: ok and means the app is foregrounded.
@@ -21,7 +27,7 @@ export function assertAmStartOk(out: string): void {
 // `pkg/fully.Qualified.Activity`. This lets the default (no-activity) branch
 // use `am start -W` for a proper blocking launch instead of `monkey 1`.
 export async function resolveLauncherActivity(udid: string, bundleId: string): Promise<string> {
-  const raw = await adbShell(udid, `cmd package resolve-activity --brief ${bundleId}`, {
+  const raw = await adbShell(udid, `cmd package resolve-activity --brief ${shellQuote(bundleId)}`, {
     timeoutMs: 10_000,
   });
   const last = raw
@@ -30,10 +36,16 @@ export async function resolveLauncherActivity(udid: string, bundleId: string): P
     .filter(Boolean)
     .pop();
   if (!last || !/^[\w.]+\/[\w.$]+$/.test(last)) {
-    throw new Error(
+    throw new FailureError(
       `Could not resolve a LAUNCHER activity for ${bundleId}. ` +
         `Install the app first, or pass an explicit \`activity\`. ` +
-        `(resolve-activity output: ${raw.trim() || "empty"})`
+        `(resolve-activity output: ${raw.trim() || "empty"})`,
+      {
+        error_code: FAILURE_CODES.ANDROID_LAUNCH_ACTIVITY_RESOLVE_FAILED,
+        failure_stage: "android_launch_resolve_activity",
+        failure_area: "tool_server",
+        error_kind: "subprocess",
+      }
     );
   }
   return last;
@@ -71,7 +83,7 @@ export const androidImpl: PlatformImpl<LaunchAppAndroidServices, LaunchAppParams
       } else {
         component = await resolveLauncherActivity(params.udid, params.bundleId);
       }
-      const out = await adbShell(params.udid, `am start -W -n ${component}`, {
+      const out = await adbShell(params.udid, `am start -W -n ${shellQuote(component)}`, {
         timeoutMs: 30_000,
       });
       assertAmStartOk(out);

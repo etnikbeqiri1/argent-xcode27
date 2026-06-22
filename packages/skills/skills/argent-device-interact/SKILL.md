@@ -1,11 +1,17 @@
 ---
 name: argent-device-interact
-description: Interact with an iOS simulator or Android emulator using argent MCP tools. Use when tapping UI elements, performing gestures, scrolling/swiping, typing text, pressing hardware buttons, launching apps, opening URLs, taking screenshots, or checking visible app state after interactions.
+description: Interact with an iOS simulator, Android emulator, or Chromium (CDP) app using argent MCP tools. Use when tapping UI elements, performing gestures, scrolling/swiping, typing text, pressing hardware buttons, launching apps, opening URLs, taking screenshots, or checking visible app state after interactions.
 ---
 
 ## Unified tool surface
 
-All interaction tools below accept a `udid` parameter and auto-dispatch iOS vs Android based on its shape (UUID → iOS simulator, anything else → Android adb serial). You use the same tool names on both platforms.
+All interaction tools below accept a `udid` parameter and auto-dispatch iOS vs Android based on its shape (UUID → iOS simulator, `chromium-cdp-<port>` → Chromium (CDP) app, anything else → Android adb serial). You use the same tool names on every platform.
+
+**Chromium (CDP) app** = any Chromium runtime exposing a Chrome DevTools Protocol endpoint: an Electron app (boot it with `boot-device` + `electronAppPath`), or any Chromium-family browser (Chrome/Brave/Edge) launched with `--remote-debugging-port`. The latter is auto-discovered by `list-devices` on port `9222` plus anything in `ARGENT_CHROMIUM_PORTS`. The same describe/tap/swipe/keyboard/screenshot surface drives all of them.
+
+**Multi-tab / windows (Chromium only):** a Chromium device may have several tabs / BrowserWindows. Use `chromium-tabs` to `list` them (stable ids `t1`, `t2`, …, optional labels), open a `new` one, `select` which is active, or `close` one. Every other tool (`describe`, `gesture-tap`, `screenshot`, `debugger-evaluate`, `open-url`, …) acts on the **active** tab, so `chromium-tabs action=select` before driving a different tab. Note: a cross-process navigation (some redirects) can swap a tab's underlying CDP target — re-run `chromium-tabs action=list` to pick it up under a fresh id.
+
+**Cookies & storage (Chromium only):** `chromium-cookies` reads/writes cookies via the Network domain (so HttpOnly cookies are visible): `action=get` (optionally scoped by `url`), `set` (`name`, `value`, + `url`/`domain`, optional `secure`/`httpOnly`/`sameSite`/`expires`), `delete` (`name`), `clear` (all). `chromium-storage` reads/writes Web Storage for the active page: `store=local|session`, `action=get` (one `key` or all entries), `set`, `remove`, `clear`. Both are per-origin / active-tab. Handy for seeding auth before a flow or asserting app state after one.
 
 For platform-specific caveats (Metro `adb reverse`, locked-screen describe errors, etc.), see § 9 Platform-specific notes at the bottom.
 
@@ -13,7 +19,7 @@ For platform-specific caveats (Metro `adb reverse`, locked-screen describe error
 
 If you delegate simulator tasks to sub-agents, make sure they have MCP permissions.
 
-Use `list-devices` to get a target id. Results are tagged with `platform` (`ios` or `android`); booted/ready devices come first. Pick the first entry that matches the platform you need — if none are ready, call `boot-device` with `udid` (iOS) or `avdName` (Android). See `argent-ios-simulator-setup` / `argent-android-emulator-setup` for full setup flow.
+Use `list-devices` to get a target id. Results are tagged with `platform` (`ios`, `android`, or `chromium`); booted/ready devices come first. Pick the first entry that matches the platform you need — if none are ready, call `boot-device` with `udid` (iOS), `avdName` (Android), or `electronAppPath` (boots an Electron app as a `chromium` device). A Chromium browser already running with a CDP port shows up directly — no `boot-device` needed. See `argent-ios-simulator-setup` / `argent-android-emulator-setup` for full setup flow.
 
 **Load tool schemas before first use.** Gesture tools (`gesture-tap`, `gesture-swipe`, `gesture-pinch`, `gesture-rotate`, `gesture-custom`) may be deferred — their parameter schemas are not loaded until fetched. Always use ToolSearch to load the schemas of all gesture tools you plan to use **before** calling any of them. If you skip this step, parameters may be coerced to strings instead of numbers, causing validation errors.
 
@@ -21,7 +27,7 @@ Use `list-devices` to get a target id. Results are tagged with `platform` (`ios`
 
 1. **Always refer to tapping_rule** from your argent.md rule before tapping.
 2. Before performing interactions, consider whether they can be **dispatched sequentially** - more on that in `run-sequence`.
-3. **Use `gesture-swipe` for lists/scrolling**, not `gesture-custom`, unless you need non-linear movement. Consider whether you need multiple swipes, if yes - use `run-sequence`.
+3. **Use `gesture-swipe` for lists/scrolling**, not `gesture-custom`, unless you need non-linear movement. On Chromium use `gesture-scroll` instead — `gesture-swipe` is touch-only. Consider whether you need multiple swipes, if yes - use `run-sequence`.
 4. **Tap a text field before typing** — on iOS try `paste` first then fall back to `keyboard`; on Android use `keyboard` directly (`paste` is iOS-only).
 5. **Coordinates are normalized** — always 0.0–1.0, not pixels.
 6. **For app navigation, prefer `describe` first.** It works on any screen without app restart. Do not navigate from screenshots on regular in-app screens unless `describe` failed to expose a reliable target. Use `native-describe-screen` only when you need app-scoped UIKit properties.
@@ -48,35 +54,37 @@ Common schemes: `messages://`, `settings://`, `maps://?q=<query>`, `tel://<numbe
 
 ## 4. Choosing the Right Tool
 
-| Action           | Tool             | Notes                                                                  |
-| ---------------- | ---------------- | ---------------------------------------------------------------------- |
-| Multiple actions | `run-sequence`   | Batch steps in one call (no intermediate screenshots)                  |
-| Open an app      | `launch-app`     | **Always — never tap home-screen icons**                               |
-| Restart an app   | `restart-app`    | Terminate and relaunch by bundle ID                                    |
-| Open URL/scheme  | `open-url`       | Web pages, deep links, URL schemes                                     |
-| Single tap       | `gesture-tap`    | Buttons, links, checkboxes                                             |
-| Scroll/swipe     | `gesture-swipe`  | Straight-line scroll or swipe                                          |
-| Long press       | `gesture-custom` | Context menus, drag start                                              |
-| Drag & drop      | `gesture-custom` | Complex drag interactions                                              |
-| Pinch/zoom       | `gesture-pinch`  | Two-finger pinch with auto-interpolation                               |
-| Rotation         | `gesture-rotate` | Two-finger rotation with auto-interpolation                            |
-| Custom gesture   | `gesture-custom` | Arbitrary touch sequences, optional interpolation                      |
-| Hardware key     | `button`         | Home, back, power, volume, appSwitch, actionButton                     |
-| Type text (fast) | `paste`          | iOS only. Form fields — uses clipboard                                 |
-| Type text        | `keyboard`       | iOS+Android. Fallback when paste fails; supports Enter, Escape, arrows |
-| Rotate device    | `rotate`         | Orientation changes                                                    |
+| Action            | Tool             | Notes                                                                  |
+| ----------------- | ---------------- | ---------------------------------------------------------------------- |
+| Multiple actions  | `run-sequence`   | Batch steps in one call (no intermediate screenshots)                  |
+| Open an app       | `launch-app`     | **Always — never tap home-screen icons**                               |
+| Restart an app    | `restart-app`    | Terminate and relaunch by bundle ID                                    |
+| Open URL/scheme   | `open-url`       | Web pages, deep links, URL schemes                                     |
+| Single tap        | `gesture-tap`    | Buttons, links, checkboxes                                             |
+| Scroll/swipe      | `gesture-swipe`  | Straight-line scroll or swipe                                          |
+| Scroll (Chromium) | `gesture-scroll` | Wheel-based; deltas are window fractions, positive deltaY = down       |
+| Drag (Chromium)   | `gesture-drag`   | Sliders, drag-and-drop, text selection                                 |
+| Long press        | `gesture-custom` | Context menus, drag start                                              |
+| Drag & drop       | `gesture-custom` | Complex drag interactions                                              |
+| Pinch/zoom        | `gesture-pinch`  | Two-finger pinch with auto-interpolation                               |
+| Rotation          | `gesture-rotate` | Two-finger rotation with auto-interpolation                            |
+| Custom gesture    | `gesture-custom` | Arbitrary touch sequences, optional interpolation                      |
+| Hardware key      | `button`         | Home, back, power, volume, appSwitch, actionButton                     |
+| Type text (fast)  | `paste`          | iOS only. Form fields — uses clipboard                                 |
+| Type text         | `keyboard`       | iOS+Android. Fallback when paste fails; supports Enter, Escape, arrows |
+| Rotate device     | `rotate`         | Orientation changes                                                    |
 
 ## 5. Finding Tap Targets
 
 IMPORTANT. When moved to a different screen after an action or do not know the coordinates of component, **always** perform proper discovery first.
 
-| App type                          | Discovery tool            | What it returns                                                                                                                                                                                                               |
-| --------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Target app discovery              | `describe`                | Accessibility element tree for the current device screen (iOS AX-service or Android uiautomator) with normalized frame coordinates. Works on any app, system dialogs, and Home screen — no app restart or `bundleId` required |
-| React Native                      | `debugger-component-tree` | React component tree with names, text, testID, and (tap: x,y)                                                                                                                                                                 |
-| App-scoped native                 | `native-describe-screen`  | Low-level app-scoped accessibility elements with normalized and raw coordinates; requires `bundleId`                                                                                                                          |
-| Permission / system modal overlay | `describe`                | `describe` detects system dialogs automatically and returns dialog buttons with tap coordinates. Fall back to `screenshot` only if `describe` does not expose the controls                                                    |
-| Final visual fallback             | `screenshot`              | Use only when discovery tools cannot inspect the current UI reliably. Do not derive routine in-app navigation targets from screenshots                                                                                        |
+| App type                          | Discovery tool            | What it returns                                                                                                                                                                                                                                     |
+| --------------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Target app discovery              | `describe`                | Accessibility element tree for the current device screen (iOS AX-service, Android uiautomator, or Chromium DOM walker) with normalized frame coordinates. Works on any app, system dialogs, and Home screen — no app restart or `bundleId` required |
+| React Native                      | `debugger-component-tree` | React component tree with names, text, testID, and (tap: x,y)                                                                                                                                                                                       |
+| App-scoped native                 | `native-describe-screen`  | Low-level app-scoped accessibility elements with normalized and raw coordinates; requires `bundleId`                                                                                                                                                |
+| Permission / system modal overlay | `describe`                | `describe` detects system dialogs automatically and returns dialog buttons with tap coordinates. Fall back to `screenshot` only if `describe` does not expose the controls                                                                          |
+| Final visual fallback             | `screenshot`              | Use only when discovery tools cannot inspect the current UI reliably. Do not derive routine in-app navigation targets from screenshots                                                                                                              |
 
 Point follow-up native diagnostics after you already have a candidate point:
 

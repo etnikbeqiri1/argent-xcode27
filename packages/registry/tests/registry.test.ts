@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { z } from "zod";
 import { Registry } from "../src/registry";
 import { TypedEventEmitter } from "../src/event-emitter";
 import { ServiceState } from "../src/types";
@@ -339,16 +340,62 @@ describe("Registry -- Tool Tests", () => {
     registry.registerBlueprint(sBlueprint);
     registry.registerTool(createMockToolDef("T", () => ({ S: staticUrn("S") })));
 
-    const invokedEvents: string[] = [];
-    const completedEvents: string[] = [];
+    const invokedEvents: Array<{ id: string; toolInvocationId: string }> = [];
+    const completedEvents: Array<{ id: string; toolInvocationId: string; durationMs: number }> = [];
 
-    registry.events.on("toolInvoked", (id) => invokedEvents.push(id));
-    registry.events.on("toolCompleted", (id) => completedEvents.push(id));
+    registry.events.on("toolInvoked", (id, toolInvocationId) =>
+      invokedEvents.push({ id, toolInvocationId })
+    );
+    registry.events.on("toolCompleted", (id, toolInvocationId, durationMs) =>
+      completedEvents.push({ id, toolInvocationId, durationMs })
+    );
 
     await registry.invokeTool("T");
 
-    expect(invokedEvents).toEqual(["T"]);
-    expect(completedEvents).toEqual(["T"]);
+    expect(invokedEvents).toHaveLength(1);
+    expect(completedEvents).toHaveLength(1);
+    expect(invokedEvents[0]).toMatchObject({ id: "T" });
+    expect(completedEvents[0]).toMatchObject({ id: "T", durationMs: expect.any(Number) });
+    expect(invokedEvents[0]!.toolInvocationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    );
+    expect(completedEvents[0]!.toolInvocationId).toBe(invokedEvents[0]!.toolInvocationId);
+  });
+
+  it("emits toolFailed with real invocation duration", async () => {
+    const registry = new Registry();
+    registry.registerTool({
+      id: "fail-duration",
+      services: () => ({}),
+      async execute() {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        throw new Error("tool failed");
+      },
+    });
+
+    const invokedEvents: Array<{ id: string; toolInvocationId: string }> = [];
+    const failedEvents: Array<{
+      id: string;
+      toolInvocationId: string;
+      error: Error;
+      durationMs?: number;
+    }> = [];
+    registry.events.on("toolInvoked", (id, toolInvocationId) => {
+      invokedEvents.push({ id, toolInvocationId });
+    });
+    registry.events.on("toolFailed", (id, toolInvocationId, error, durationMs) => {
+      failedEvents.push({ id, toolInvocationId, error, durationMs });
+    });
+
+    await expect(registry.invokeTool("fail-duration")).rejects.toThrow(ToolExecutionError);
+
+    expect(invokedEvents).toHaveLength(1);
+    expect(failedEvents).toHaveLength(1);
+    expect(failedEvents[0]).toMatchObject({ id: "fail-duration" });
+    expect(failedEvents[0]!.toolInvocationId).toBe(invokedEvents[0]!.toolInvocationId);
+    expect(failedEvents[0]!.error).toBeInstanceOf(ToolExecutionError);
+    expect(failedEvents[0]!.durationMs).toEqual(expect.any(Number));
+    expect(failedEvents[0]!.durationMs!).toBeGreaterThan(0);
   });
 });
 
@@ -538,5 +585,79 @@ describe("Registry -- getTool and extensions", () => {
     await registry.invokeTool("T");
     expect(capturedOptions.length).toBe(1);
     expect(capturedOptions[0]).toEqual({ token: "xyz" });
+  });
+});
+
+describe("Registry -- invokeTool zod enforcement (PR #194 injection root cause)", () => {
+  it("rejects params that fail the tool's zodSchema, without calling execute", async () => {
+    const registry = new Registry();
+    let executed = false;
+    registry.registerTool({
+      id: "T",
+      zodSchema: z.object({ port: z.number() }),
+      services: () => ({}),
+      async execute() {
+        executed = true;
+        return null;
+      },
+    });
+
+    // A flow-execute / run-sequence style call with a string where the schema
+    // says number — previously this reached execute() raw (→ shell injection).
+    await expect(registry.invokeTool("T", { port: "0; touch /tmp/pwn; #" })).rejects.toThrow(
+      /Invalid params for tool "T"/
+    );
+    expect(executed).toBe(false);
+  });
+
+  it("passes zod-parsed data (defaults applied) to execute on valid input", async () => {
+    const registry = new Registry();
+    let received: unknown;
+    registry.registerTool({
+      id: "T",
+      zodSchema: z.object({ port: z.coerce.number().default(8081) }),
+      services: () => ({}),
+      async execute(_s, params) {
+        received = params;
+        return null;
+      },
+    });
+
+    await registry.invokeTool("T", { port: "1234" });
+    expect(received).toEqual({ port: 1234 }); // coerced, not the raw string
+  });
+
+  it("treats missing params as {} so no-arg tools (z.object({})) still invoke", async () => {
+    const registry = new Registry();
+    let executed = false;
+    registry.registerTool({
+      id: "T",
+      zodSchema: z.object({}),
+      services: () => ({}),
+      async execute() {
+        executed = true;
+        return "ok";
+      },
+    });
+
+    const result = await registry.invokeTool("T");
+    expect(result).toBe("ok");
+    expect(executed).toBe(true);
+  });
+
+  it("leaves schema-less tools untouched (params passed through)", async () => {
+    const registry = new Registry();
+    let received: unknown;
+    registry.registerTool({
+      id: "T",
+      services: () => ({}),
+      async execute(_s, params) {
+        received = params;
+        return null;
+      },
+    });
+
+    await registry.invokeTool("T", { anything: "goes" });
+    expect(received).toEqual({ anything: "goes" });
   });
 });

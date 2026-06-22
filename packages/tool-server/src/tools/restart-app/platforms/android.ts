@@ -1,5 +1,6 @@
+import { FAILURE_CODES, FailureError } from "@argent/registry";
 import type { PlatformImpl } from "../../../utils/cross-platform-tool";
-import { adbShell } from "../../../utils/adb";
+import { adbShell, shellQuote } from "../../../utils/adb";
 import { assertAmStartOk, resolveLauncherActivity } from "../../launch-app/platforms/android";
 import type { RestartAppAndroidServices, RestartAppParams, RestartAppResult } from "../types";
 
@@ -11,7 +12,7 @@ export const androidImpl: PlatformImpl<
   requires: ["adb"],
   handler: async (_services, params) => {
     const { udid, bundleId, activity } = params;
-    await adbShell(udid, `am force-stop ${bundleId}`, { timeoutMs: 15_000 });
+    await adbShell(udid, `am force-stop ${shellQuote(bundleId)}`, { timeoutMs: 15_000 });
     // Match launch-app's relaunch path: `monkey` returns as soon as the intent
     // is injected and its /No activities found|Error:/ scrape false-failed on
     // legitimate class names like `com.example.ErrorReportingActivity`. Use
@@ -27,11 +28,22 @@ export const androidImpl: PlatformImpl<
     } else {
       component = await resolveLauncherActivity(udid, bundleId);
     }
-    const out = await adbShell(udid, `am start -W -n ${component}`, { timeoutMs: 30_000 });
+    const out = await adbShell(udid, `am start -W -n ${shellQuote(component)}`, {
+      timeoutMs: 30_000,
+    });
     try {
       assertAmStartOk(out);
     } catch (err) {
-      throw new Error(`relaunch failed: ${err instanceof Error ? err.message : String(err)}`);
+      throw new FailureError(
+        `relaunch failed: ${err instanceof Error ? err.message : String(err)}`,
+        {
+          error_code: FAILURE_CODES.ANDROID_RESTART_FAILED,
+          failure_stage: "android_restart_am_start",
+          failure_area: "tool_server",
+          error_kind: "subprocess",
+        },
+        { cause: err instanceof Error ? err : new Error(String(err)) }
+      );
     }
     return { restarted: true, bundleId };
   },

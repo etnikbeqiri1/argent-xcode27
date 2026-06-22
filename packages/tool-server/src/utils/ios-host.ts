@@ -218,7 +218,7 @@ async function listRunningUIKitApplicationBundleIds(udid: string): Promise<Set<s
 
   const bundleIds = new Set<string>();
   for (const line of stdout.split("\n")) {
-    const match = line.match(/UIKitApplication:([^\[]+)/);
+    const match = line.match(/UIKitApplication:([^[]+)/);
     if (match) {
       bundleIds.add(match[1].trim());
     }

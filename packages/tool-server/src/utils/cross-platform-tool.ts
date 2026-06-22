@@ -5,7 +5,7 @@ import type {
   ToolDependency,
 } from "@argent/registry";
 import { resolveDevice } from "./device-info";
-import { assertSupported } from "./capability";
+import { assertSupported, NotImplementedOnPlatformError } from "./capability";
 import { ensureDeps } from "./check-deps";
 
 /**
@@ -46,12 +46,18 @@ export interface PlatformImpl<Services, Params, Result> {
  * `Services` is the shape of services the tool declares — typed so handlers
  * see real names (e.g. `services.simulatorServer`) instead of the raw
  * `Record<string, unknown>` the registry hands in.
+ *
+ * The `chromium` branch is optional. When omitted, a chromium device triggers
+ * `NotImplementedOnPlatformError` — the capability gate normally fires first,
+ * so this only matters for tools that declare chromium support without wiring
+ * a handler.
  */
 export function dispatchByPlatform<
   IosServices,
   AndroidServices,
   Params extends { udid: string },
   Result,
+  ChromiumServices = Record<string, unknown>,
   IosRemoteServices = IosServices,
 >(opts: {
   toolId: string;
@@ -65,6 +71,7 @@ export function dispatchByPlatform<
    * branch + the matrix), and the absence of either is a clean 400.
    */
   iosRemote?: PlatformImpl<IosRemoteServices, Params, Result>;
+  chromium?: PlatformImpl<ChromiumServices, Params, Result>;
 }): (
   services: Record<string, unknown>,
   params: Params,
@@ -96,11 +103,29 @@ export function dispatchByPlatform<
         invokeOptions
       );
     }
-    if (opts.android.requires?.length) {
-      await ensureDeps(opts.android.requires);
+    if (device.platform === "android") {
+      if (opts.android.requires?.length) {
+        await ensureDeps(opts.android.requires);
+      }
+      return opts.android.handler(
+        services as unknown as AndroidServices,
+        params,
+        device,
+        invokeOptions
+      );
     }
-    return opts.android.handler(
-      services as unknown as AndroidServices,
+    // chromium
+    if (!opts.chromium) {
+      throw new NotImplementedOnPlatformError({
+        toolId: opts.toolId,
+        platform: "chromium",
+      });
+    }
+    if (opts.chromium.requires?.length) {
+      await ensureDeps(opts.chromium.requires);
+    }
+    return opts.chromium.handler(
+      services as unknown as ChromiumServices,
       params,
       device,
       invokeOptions

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Registry } from "@argent/registry";
 
 type ExecFileCallback = (error: Error | null, stdout?: string, stderr?: string) => void;
@@ -44,7 +44,16 @@ import { createBootDeviceTool } from "../src/tools/devices/boot-device";
 import { __primeDepCacheForTests, __resetDepCacheForTests } from "../src/utils/check-deps";
 
 describe("boot-device — iOS path", () => {
+  // The iOS path is only reachable on darwin (boot-device now refuses iOS
+  // udids on non-darwin hosts so a Linux user gets a clear "iOS requires
+  // macOS" message instead of a misleading xcode-select hint). These tests
+  // exercise the post-gate code path, so override process.platform for the
+  // duration of the suite — restored after each test to avoid leaking the
+  // override into other test files run in the same vitest worker.
+  const originalPlatform = process.platform;
+
   beforeEach(() => {
+    Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
     vi.clearAllMocks();
     // Pre-warm the dep cache so `ensureDep('xcrun')` doesn't probe PATH and
     // add an extra first `command -v xcrun` call to mockExecFile.
@@ -66,8 +75,13 @@ describe("boot-device — iOS path", () => {
     isEntitlementBypassActiveMock.mockReset().mockResolvedValue(true);
   });
 
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+  });
+
   it("pre-boots AX prefs on a Shutdown sim then waits for boot completion and native-devtools init", async () => {
-    const resolveService = vi.fn(async () => ({ getInitFailure: () => null }));
+    const reverifyEnv = vi.fn(async () => {});
+    const resolveService = vi.fn(async () => ({ getInitFailure: () => null, reverifyEnv }));
     const registry = {
       resolveService,
     } as unknown as Registry;
@@ -127,10 +141,17 @@ describe("boot-device — iOS path", () => {
     expect(resolveService.mock.invocationCallOrder[0]).toBeLessThan(
       mockExecFile.mock.invocationCallOrder[2]
     );
+    // The (re)boot wipes launchd's DYLD_INSERT_LIBRARIES; boot-device must
+    // force a re-apply so a cached/latched native-devtools service can't leave
+    // the env unset (which would make the next launch uninjected).
+    expect(reverifyEnv).toHaveBeenCalledOnce();
   });
 
   it("skips pre-boot plist write when the sim is already Booted and falls back to ensureAutomationEnabled", async () => {
-    const resolveService = vi.fn(async () => ({ getInitFailure: () => null }));
+    const resolveService = vi.fn(async () => ({
+      getInitFailure: () => null,
+      reverifyEnv: async () => {},
+    }));
     const registry = { resolveService } as unknown as Registry;
     const tool = createBootDeviceTool(registry);
 
@@ -150,7 +171,10 @@ describe("boot-device — iOS path", () => {
     // writes prefs best-effort.
     listIosSimulatorsMock.mockResolvedValueOnce([]);
 
-    const resolveService = vi.fn(async () => ({ getInitFailure: () => null }));
+    const resolveService = vi.fn(async () => ({
+      getInitFailure: () => null,
+      reverifyEnv: async () => {},
+    }));
     const registry = { resolveService } as unknown as Registry;
     const tool = createBootDeviceTool(registry);
 
@@ -167,7 +191,10 @@ describe("boot-device — iOS path", () => {
     // ensureAutomationEnabled writes prefs best-effort post-boot.
     setAccessibilityPrefsPreBootMock.mockRejectedValueOnce(new Error("plutil missing"));
 
-    const resolveService = vi.fn(async () => ({ getInitFailure: () => null }));
+    const resolveService = vi.fn(async () => ({
+      getInitFailure: () => null,
+      reverifyEnv: async () => {},
+    }));
     const registry = { resolveService } as unknown as Registry;
     const tool = createBootDeviceTool(registry);
 
@@ -184,6 +211,7 @@ describe("boot-device — iOS path", () => {
 
   it("returns a structured init_failed result when native-devtools has given up", async () => {
     const resolveService = vi.fn(async () => ({
+      reverifyEnv: async () => {},
       getInitFailure: () => ({
         attempts: 3,
         lastError: "simctl spawn timed out",
@@ -216,7 +244,10 @@ describe("boot-device — iOS path", () => {
         return {} as never;
       });
 
-    const resolveService = vi.fn(async () => ({ getInitFailure: () => null }));
+    const resolveService = vi.fn(async () => ({
+      getInitFailure: () => null,
+      reverifyEnv: async () => {},
+    }));
     const registry = { resolveService } as unknown as Registry;
 
     const tool = createBootDeviceTool(registry);
@@ -243,7 +274,10 @@ describe("boot-device — iOS path", () => {
   });
 
   it("force=true on a Booted sim triggers shutdown → pre-boot write → boot", async () => {
-    const resolveService = vi.fn(async () => ({ getInitFailure: () => null }));
+    const resolveService = vi.fn(async () => ({
+      getInitFailure: () => null,
+      reverifyEnv: async () => {},
+    }));
     const registry = { resolveService } as unknown as Registry;
     const tool = createBootDeviceTool(registry);
 
@@ -270,7 +304,10 @@ describe("boot-device — iOS path", () => {
   });
 
   it("force not set on a Booted sim does not shut down", async () => {
-    const resolveService = vi.fn(async () => ({ getInitFailure: () => null }));
+    const resolveService = vi.fn(async () => ({
+      getInitFailure: () => null,
+      reverifyEnv: async () => {},
+    }));
     const registry = { resolveService } as unknown as Registry;
     const tool = createBootDeviceTool(registry);
 
@@ -301,7 +338,7 @@ describe("boot-device — input validation (exclusive udid/avdName)", () => {
           avdName: "Pixel_7_API_34",
         }
       )
-    ).rejects.toThrow(/exactly one of `udid` .* or `avdName`/);
+    ).rejects.toThrow(/exactly one of `udid`/);
   });
 
   it("rejects when neither udid nor avdName is provided — no target", async () => {
@@ -315,5 +352,36 @@ describe("boot-device — input validation (exclusive udid/avdName)", () => {
     expect(tool.zodSchema!.safeParse({ avdName: "x", bootTimeoutMs: 29_999 }).success).toBe(false);
     expect(tool.zodSchema!.safeParse({ avdName: "x", bootTimeoutMs: 900_001 }).success).toBe(false);
     expect(tool.zodSchema!.safeParse({ avdName: "x", bootTimeoutMs: 60_000 }).success).toBe(true);
+  });
+});
+
+// Non-darwin hosts that receive an iOS udid must get a clear "iOS requires
+// macOS" error — NOT the legacy "install xcode-select" hint, which would send
+// a Linux user chasing a tool that has no Linux build. This regression test
+// pins that branch so a future refactor of bootIos doesn't quietly drop the
+// platform check.
+describe("boot-device — iOS udid on non-darwin", () => {
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    vi.clearAllMocks();
+    __resetDepCacheForTests();
+  });
+
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+  });
+
+  it("rejects with a platform-specific message that names the correct fix", async () => {
+    const tool = createBootDeviceTool({ resolveService: async () => ({}) } as unknown as Registry);
+    await expect(
+      tool.execute!({}, { udid: "deadbeef-dead-beef-dead-beefdeadbeef" })
+    ).rejects.toThrow(/iOS Simulator is unavailable on linux.*requires a macOS host/);
+    // The misleading legacy hint must NOT appear: a Linux user shouldn't be
+    // told to install xcode-select, which has no Linux build.
+    await expect(
+      tool.execute!({}, { udid: "deadbeef-dead-beef-dead-beefdeadbeef" })
+    ).rejects.not.toThrow(/xcode-select/);
   });
 });

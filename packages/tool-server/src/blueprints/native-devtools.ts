@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as readline from "node:readline";
 import {
   TypedEventEmitter,
+  FAILURE_CODES,
+  FailureError,
   type DeviceInfo,
   type ServiceBlueprint,
   type ServiceEvents,
@@ -141,6 +143,15 @@ export interface NativeDevtoolsApi {
   isEnvSetup(): boolean;
   readonly socketPath: string;
   ensureEnvReady(): Promise<void>;
+  /**
+   * Force a fresh `ensureEnv` pass, bypassing the one-shot `ensureEnvReady`
+   * latch. `ensureEnvReady` caches success and never runs again, so it cannot
+   * notice that an out-of-band simulator reboot wiped `DYLD_INSERT_LIBRARIES`
+   * from launchd. Callers that have evidence the env may be stale (e.g. a
+   * running app that isn't connected) use this to re-apply it. `ensureEnv` is
+   * idempotent, so this is a cheap no-op when the env is already correct.
+   */
+  reverifyEnv(): Promise<void>;
   getInitFailure(): NativeDevtoolsInitFailure | null;
 
   // App-level — all keyed by bundleId
@@ -192,16 +203,28 @@ export const nativeDevtoolsBlueprint: ServiceBlueprint<NativeDevtoolsApi, Device
   async factory(_deps, _payload, options) {
     const opts = options as unknown as NativeDevtoolsFactoryOptions | undefined;
     if (!opts?.device) {
-      throw new Error(
+      throw new FailureError(
         `${NATIVE_DEVTOOLS_NAMESPACE}.factory requires a resolved DeviceInfo via options.device. ` +
-          `Use nativeDevtoolsRef(device) when registering the service ref, or pass { device } when calling resolveService directly.`
+          `Use nativeDevtoolsRef(device) when registering the service ref, or pass { device } when calling resolveService directly.`,
+        {
+          error_code: FAILURE_CODES.NATIVE_DEVTOOLS_FACTORY_OPTIONS_MISSING,
+          failure_stage: "native_devtools_factory_options",
+          failure_area: "tool_server",
+          error_kind: "validation",
+        }
       );
     }
 
     const { device } = opts;
     if (device.platform !== "ios" && device.platform !== "ios-remote") {
-      throw new Error(
-        `${NATIVE_DEVTOOLS_NAMESPACE} is iOS-only. The target '${device.id}' classifies as Android — native-devtools tools (native-describe-screen, native-find-views, etc.) only drive iOS simulators. Pick an iOS udid from list-devices.`
+      throw new FailureError(
+        `${NATIVE_DEVTOOLS_NAMESPACE} is iOS-only. The target '${device.id}' classifies as ${device.platform} — native-devtools tools (native-describe-screen, native-find-views, etc.) only drive iOS simulators. Pick an iOS udid from list-devices.`,
+        {
+          error_code: FAILURE_CODES.NATIVE_DEVTOOLS_WRONG_PLATFORM,
+          failure_stage: "native_devtools_factory_options",
+          failure_area: "tool_server",
+          error_kind: "validation",
+        }
       );
     }
     const host = pickIosHost(device);
@@ -248,8 +271,9 @@ export const nativeDevtoolsBlueprint: ServiceBlueprint<NativeDevtoolsApi, Device
       process.stderr.write(message);
     };
 
-    const ensureEnvReady = (): Promise<void> => {
-      if (envSetup || initFailure?.givenUp) return Promise.resolve();
+    // Runs `ensureEnv` under the in-flight concurrency guard with no latch
+    // check. Overlapping callers collapse onto the same promise.
+    const runEnsureEnv = (): Promise<void> => {
       if (inFlight) return inFlight;
 
       inFlight = Promise.resolve()
@@ -269,6 +293,21 @@ export const nativeDevtoolsBlueprint: ServiceBlueprint<NativeDevtoolsApi, Device
       return inFlight;
     };
 
+    // Hot path: skip the simctl round-trips once the env has been applied
+    // successfully (or we've given up). Most tool calls hit this.
+    const ensureEnvReady = (): Promise<void> => {
+      if (envSetup || initFailure?.givenUp) return Promise.resolve();
+      return runEnsureEnv();
+    };
+
+    // Recovery path: re-apply the env even when the latch says it's already
+    // set, so a sim reboot that cleared DYLD_INSERT_LIBRARIES is repaired.
+    // Still honours the give-up guard so a hard-failed sim doesn't spin.
+    const reverifyEnv = (): Promise<void> => {
+      if (initFailure?.givenUp) return Promise.resolve();
+      return runEnsureEnv();
+    };
+
     const isAppRunning = async (bundleId: string): Promise<boolean> => {
       const runningBundleIds = await host.listRunningBundleIds(udid);
       return runningBundleIds.has(bundleId);
@@ -282,7 +321,12 @@ export const nativeDevtoolsBlueprint: ServiceBlueprint<NativeDevtoolsApi, Device
       const conn = connections.get(targetBundleId);
       if (!conn) {
         return Promise.reject(
-          new Error("Native devtools not connected for bundleId: " + targetBundleId)
+          new FailureError("Native devtools not connected for bundleId: " + targetBundleId, {
+            error_code: FAILURE_CODES.NATIVE_DEVTOOLS_NOT_CONNECTED,
+            failure_stage: "native_devtools_rpc_connection",
+            failure_area: "tool_server",
+            error_kind: "not_found",
+          })
         );
       }
       const id = nextRpcId++;
@@ -297,7 +341,14 @@ export const nativeDevtoolsBlueprint: ServiceBlueprint<NativeDevtoolsApi, Device
         setTimeout(() => {
           if (pendingRpc.has(id)) {
             pendingRpc.delete(id);
-            reject(new Error(`ViewInspector RPC timed out: ${method}`));
+            reject(
+              new FailureError(`ViewInspector RPC timed out: ${method}`, {
+                error_code: FAILURE_CODES.NATIVE_DEVTOOLS_RPC_TIMEOUT,
+                failure_stage: "native_devtools_rpc_request",
+                failure_area: "tool_server",
+                error_kind: "timeout",
+              })
+            );
           }
         }, 5000);
       });
@@ -307,7 +358,9 @@ export const nativeDevtoolsBlueprint: ServiceBlueprint<NativeDevtoolsApi, Device
     if (transport === "unix") {
       try {
         fs.unlinkSync(socketPath);
-      } catch {}
+      } catch {
+        /* no stale socket to remove; ignore */
+      }
     }
 
     // ── Socket server ─────────────────────────────────────────────────────────
@@ -373,8 +426,16 @@ export const nativeDevtoolsBlueprint: ServiceBlueprint<NativeDevtoolsApi, Device
           const pending = pendingRpc.get(p.id);
           if (!pending) return;
           pendingRpc.delete(p.id);
-          if (p.error) pending.reject(new Error(p.error.message));
-          else pending.resolve(p.result);
+          if (p.error) {
+            pending.reject(
+              new FailureError(p.error.message, {
+                error_code: FAILURE_CODES.NATIVE_DEVTOOLS_RPC_ERROR,
+                failure_stage: "native_devtools_rpc_response",
+                failure_area: "tool_server",
+                error_kind: "subprocess",
+              })
+            );
+          } else pending.resolve(p.result);
         }
       });
 
@@ -429,6 +490,7 @@ export const nativeDevtoolsBlueprint: ServiceBlueprint<NativeDevtoolsApi, Device
       isEnvSetup: () => envSetup,
       socketPath,
       ensureEnvReady,
+      reverifyEnv,
       getInitFailure: () => initFailure,
 
       isConnected: (bundleId) => connections.has(bundleId),
@@ -438,8 +500,10 @@ export const nativeDevtoolsBlueprint: ServiceBlueprint<NativeDevtoolsApi, Device
       async requiresAppRestart(bundleId) {
         if (connections.has(bundleId)) return false;
         // Re-verify and re-set env — handles the case where the simulator was
-        // rebooted and launchd cleared DYLD_INSERT_LIBRARIES
-        await ensureEnvReady();
+        // rebooted and launchd cleared DYLD_INSERT_LIBRARIES. Must use
+        // reverifyEnv (not ensureEnvReady): the latter latches after the first
+        // success and would skip re-applying the wiped env.
+        await reverifyEnv();
         return true;
       },
 
@@ -532,10 +596,19 @@ export const nativeDevtoolsBlueprint: ServiceBlueprint<NativeDevtoolsApi, Device
         if (transport === "unix") {
           try {
             fs.unlinkSync(socketPath);
-          } catch {}
+          } catch {
+            /* best-effort socket cleanup; ignore errors */
+          }
         }
         for (const { reject } of pendingRpc.values()) {
-          reject(new Error("NativeDevtools service disposed"));
+          reject(
+            new FailureError("NativeDevtools service disposed", {
+              error_code: FAILURE_CODES.NATIVE_DEVTOOLS_SERVICE_DISPOSED,
+              failure_stage: "native_devtools_dispose",
+              failure_area: "tool_server",
+              error_kind: "unknown",
+            })
+          );
         }
         pendingRpc.clear();
         if (endpoint.transport === "tcp") {

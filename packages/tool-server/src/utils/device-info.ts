@@ -1,11 +1,12 @@
 import type { DeviceInfo, DeviceKind, Platform } from "@argent/registry";
 
 /**
- * iOS simulator UDID format: 8-4-4-4-12 hex with dashes. Anything else is treated
- * as an Android adb serial. We rely on shape rather than listing devices because
- * `xcrun simctl list` and `adb devices` are slow enough that classifying a hot
- * tool call would dominate its latency. A future enhancement can fall back to
- * listing when shape is ambiguous.
+ * iOS simulator UDID format: 8-4-4-4-12 hex with dashes. Chromium devices use the
+ * `chromium-cdp-<port>` prefix so they can be told apart from both iOS UUIDs and
+ * Android adb serials by shape alone. Anything else is treated as an Android
+ * serial. Classification is shape-based because `xcrun simctl list` and
+ * `adb devices` are slow enough that listing on every hot tool call would
+ * dominate its latency.
  */
 const IOS_UDID_SHAPE =
   /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
@@ -28,19 +29,63 @@ export function withRemotePrefix(udid: string): string {
   return udid.startsWith(REMOTE_PREFIX) ? udid : `${REMOTE_PREFIX}${udid}`;
 }
 
+export const CHROMIUM_ID_PREFIX = "chromium-cdp-";
+
 /** Returns the platform a `udid` belongs to based on its shape. */
 export function classifyDevice(udid: string): Platform {
   if (udid.startsWith(REMOTE_PREFIX)) return "ios-remote";
+  if (udid.startsWith(CHROMIUM_ID_PREFIX)) return "chromium";
   return IOS_UDID_SHAPE.test(udid) ? "ios" : "android";
 }
 
 /**
- * Build a `DeviceInfo` from a raw udid. v1 fills the platform and a default
- * kind ('simulator' for iOS / ios-remote, 'emulator' for Android) — platform
- * impls can enrich with name/state/sdkLevel via simctl/adb/sim-remote as needed.
+ * Distinguish a physical Android phone from an emulator by serial shape. Local
+ * emulators always register with adb as `emulator-<port>` (set by the emulator
+ * itself), so any other Android serial — a USB device's hardware serial, or an
+ * `ip:port` from wireless debugging — is a physical device. This mirrors how
+ * radon detects connected phones (it filters the `emulator-` prefix out of
+ * `adb devices`) and, like the rest of this module, stays purely shape-based so
+ * it adds no `adb` round-trip on the hot path.
+ *
+ * The distinction matters because the two are driven by different
+ * simulator-server controllers: emulators stream decoded RGB over the emulator
+ * gRPC bridge (`android` subcommand), while physical devices run the
+ * screen-sharing agent and stream H264 over adb (`android_device` subcommand).
+ */
+export function isAndroidEmulatorSerial(serial: string): boolean {
+  return serial.startsWith("emulator-");
+}
+
+/**
+ * Build a `DeviceInfo` from a raw udid. Fills the platform and a default kind
+ * ('simulator' for iOS / ios-remote, 'emulator'/'device' for Android by serial
+ * shape, 'app' for Chromium) — platform impls can enrich with name/state/sdkLevel
+ * via simctl/adb/sim-remote if needed.
  */
 export function resolveDevice(udid: string): DeviceInfo {
   const platform = classifyDevice(udid);
-  const kind: DeviceKind = platform === "android" ? "emulator" : "simulator";
+  const kind: DeviceKind =
+    platform === "ios" || platform === "ios-remote"
+      ? "simulator"
+      : platform === "android"
+        ? isAndroidEmulatorSerial(udid)
+          ? "emulator"
+          : "device"
+        : "app";
   return { id: udid, platform, kind };
+}
+
+/** Parses the CDP port out of a chromium device id. Returns null if the id is malformed. */
+export function parseChromiumCdpPort(udid: string): number | null {
+  if (!udid.startsWith(CHROMIUM_ID_PREFIX)) return null;
+  const tail = udid.slice(CHROMIUM_ID_PREFIX.length);
+  if (!/^\d+$/.test(tail)) return null;
+  const port = Number.parseInt(tail, 10);
+  if (!Number.isFinite(port) || port <= 0 || port > 65535) return null;
+  return port;
+}
+
+/** Build the canonical chromium device id from a CDP port. */
+export function chromiumIdFromPort(port: number): string {
+  return `${CHROMIUM_ID_PREFIX}${port}`;
 }

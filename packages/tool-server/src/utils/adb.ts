@@ -1,5 +1,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import {
+  FAILURE_CODES,
+  FailureError,
+  subprocessFailureMetadata,
+  type FailureSignal,
+} from "@argent/registry";
 import { resolveAndroidBinary } from "./android-binary";
 
 const execFileAsync = promisify(execFile);
@@ -16,9 +22,15 @@ const execFileAsync = promisify(execFile);
 async function resolveAdbOrThrow(): Promise<string> {
   const path = await resolveAndroidBinary("adb");
   if (!path) {
-    throw new Error(
+    throw new FailureError(
       "`adb` not found on PATH or under `$ANDROID_HOME/platform-tools`. " +
-        "Install Android SDK Platform Tools or set `$ANDROID_HOME` to your SDK root."
+        "Install Android SDK Platform Tools or set `$ANDROID_HOME` to your SDK root.",
+      {
+        error_code: FAILURE_CODES.ANDROID_ADB_NOT_FOUND,
+        failure_stage: "android_adb_resolve_binary",
+        failure_area: "tool_server",
+        error_kind: "dependency_missing",
+      }
     );
   }
   return path;
@@ -27,12 +39,70 @@ async function resolveAdbOrThrow(): Promise<string> {
 export async function resolveEmulatorOrThrow(): Promise<string> {
   const path = await resolveAndroidBinary("emulator");
   if (!path) {
-    throw new Error(
+    throw new FailureError(
       "`emulator` not found on PATH or under `$ANDROID_HOME/emulator`. " +
-        "Install the Android Emulator package or set `$ANDROID_HOME` to your SDK root."
+        "Install the Android Emulator package or set `$ANDROID_HOME` to your SDK root.",
+      {
+        error_code: FAILURE_CODES.ANDROID_EMULATOR_NOT_FOUND,
+        failure_stage: "android_emulator_resolve_binary",
+        failure_area: "tool_server",
+        error_kind: "dependency_missing",
+      }
     );
   }
   return path;
+}
+
+// Memoize per (binary path + flag): `-help` output is stable for a given
+// binary, and a boot may probe more than one flag. Cleared implicitly when the
+// process restarts after an emulator update.
+const emulatorFlagSupportCache = new Map<string, boolean>();
+
+/**
+ * Feature-detect whether the resolved `emulator` binary accepts a given
+ * command-line flag, by checking whether it appears in `emulator -help`.
+ *
+ * Some launch flags exist only in newer emulator builds and are undocumented
+ * in the release notes (e.g. `-crash-report-mode`, added in ~36.x and late
+ * 35.x), so the binary's own `-help` listing is the only reliable signal.
+ * Passing an unrecognized flag makes the emulator abort before boot, so callers
+ * must gate on this before adding such a flag to the launch args.
+ *
+ * Best-effort: returns false if the binary cannot be resolved or `-help` cannot
+ * be run, and never throws.
+ */
+export async function emulatorSupportsFlag(
+  flag: string,
+  options: { timeoutMs?: number } = {}
+): Promise<boolean> {
+  let emulatorPath: string;
+  try {
+    emulatorPath = await resolveEmulatorOrThrow();
+  } catch {
+    return false;
+  }
+
+  const cacheKey = `${emulatorPath}|${flag}`;
+  const cached = emulatorFlagSupportCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  let output: string;
+  try {
+    const { stdout, stderr } = await execFileAsync(emulatorPath, ["-help"], {
+      timeout: options.timeoutMs ?? 10_000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    output = stdout + stderr;
+  } catch (err) {
+    // `emulator -help` exits non-zero on some builds; the listing is still
+    // attached to the error. Inspect whatever was captured before giving up.
+    const e = err as { stdout?: string; stderr?: string };
+    output = (e.stdout ?? "") + (e.stderr ?? "");
+  }
+
+  const supported = output.includes(flag);
+  emulatorFlagSupportCache.set(cacheKey, supported);
+  return supported;
 }
 
 export interface AdbRunResult {
@@ -60,15 +130,22 @@ function describeAdbFailure(args: string[], err: unknown): Error {
     message?: string;
   };
   const argv = args.join(" ");
+  const signal: FailureSignal = {
+    error_code: FAILURE_CODES.ANDROID_ADB_COMMAND_FAILED,
+    failure_stage: "android_adb_command",
+    failure_area: "tool_server",
+    error_kind: e.killed || e.signal ? "timeout" : "subprocess",
+    ...subprocessFailureMetadata(err, "adb"),
+  };
   const ioDetail = (e.stderr ?? "").trim() || (e.stdout ?? "").trim();
-  if (ioDetail) return new Error(`adb ${argv} failed: ${ioDetail}`);
+  if (ioDetail) return new FailureError(`adb ${argv} failed: ${ioDetail}`, signal);
   const meta: string[] = [];
   if (e.killed) meta.push("killed=true");
   if (e.signal) meta.push(`signal=${e.signal}`);
   if (e.code) meta.push(`code=${e.code}`);
   const baseMsg = (e.message ?? String(err)).trim();
   const suffix = meta.length ? ` (${meta.join(" ")})` : "";
-  return new Error(`adb ${argv} failed: ${baseMsg}${suffix}`);
+  return new FailureError(`adb ${argv} failed: ${baseMsg}${suffix}`, signal);
 }
 
 /**
@@ -115,6 +192,18 @@ async function runAdbBinary(args: string[], options: { timeoutMs?: number } = {}
   } catch (err) {
     throw describeAdbFailure(args, err);
   }
+}
+
+/**
+ * POSIX single-quote escape for a value interpolated into an `adb shell`
+ * command string. `adb shell <str>` re-parses <str> through the device's
+ * /bin/sh, so an unquoted bundleId/activity like `x; rm -rf /` would execute
+ * on the device. Wrapping in single quotes and escaping embedded quotes makes
+ * the value an inert single token. (open-url/platforms/android.ts already does
+ * this inline for URLs; this is the shared form.)
+ */
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 /** `adb -s <serial> shell <shellCommand>` with the shell command passed as a single argv entry. */
@@ -315,16 +404,28 @@ export async function waitForBootCompleted(
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (isTerminalAdbError(message)) {
-        throw new Error(
+        throw new FailureError(
           `Cannot wait for ${serial} to boot — adb reports the device is in a terminal state: ${message}.` +
-            ` Authorise the device, reconnect it, or pick a different target.`
+            ` Authorise the device, reconnect it, or pick a different target.`,
+          {
+            error_code: FAILURE_CODES.ANDROID_ADB_BOOT_TERMINAL_STATE,
+            failure_stage: "android_wait_for_boot",
+            failure_area: "tool_server",
+            error_kind: "subprocess",
+          },
+          { cause: err instanceof Error ? err : new Error(String(err)) }
         );
       }
       // Otherwise: device may be mid-boot; swallow and retry.
     }
     await new Promise((r) => setTimeout(r, 1_000));
   }
-  throw new Error(`Timed out waiting for ${serial} to finish booting`);
+  throw new FailureError(`Timed out waiting for ${serial} to finish booting`, {
+    error_code: FAILURE_CODES.ANDROID_ADB_BOOT_TIMEOUT,
+    failure_stage: "android_wait_for_boot",
+    failure_area: "tool_server",
+    error_kind: "timeout",
+  });
 }
 
 export interface AvdInfo {

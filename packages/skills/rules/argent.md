@@ -4,7 +4,7 @@ alwaysApply: true
 ---
 
 <description>
-Argent MCP tools are available in this project for iOS simulator and Android emulator control. Argent MCP tools are the preferred form of interaction with the application.
+If argent is installed and configured in this environment, its MCP tools are the preferred form of interaction with the application for iOS simulator, Android emulator, and Chromium (CDP) app control; otherwise see `<availability_check>` below before attempting any argent workflow. A "Chromium (CDP) app" is any Chromium runtime exposing a Chrome DevTools Protocol endpoint — an Electron app, or any Chromium-family browser (Chrome/Brave/Edge) launched with `--remote-debugging-port`; all are driven through the same tool surface and tagged `platform: "chromium"`.
 Running MCP server and managing the Argent toolkit utilises `argent` command - if asked use `argent --help` for reference.
 To check current version of MCP server run `argent --version` command.
 
@@ -17,7 +17,23 @@ Use cases:
 - Any request to execute manual QA, UI QA, or visual behavior validation for a mobile app
 - Running, debugging, or testing a React Native app (iOS or Android)
 - Profiling performance or diagnosing re-renders in a React Native app (iOS or Android)
+- Running, debugging, or testing a Chromium (CDP) app — an Electron app (boot with `boot-device` + `electronAppPath`) or a Chromium browser exposing CDP (auto-discovered on port `9222` / `ARGENT_CHROMIUM_PORTS`); on Chromium scroll with `gesture-scroll` and drag with `gesture-drag` — `gesture-swipe` is touch-only
   </description>
+
+<availability_check>
+<important>Run this check once per session, before the first argent tool call or `argent` command. Do not re-probe before later calls.</important>
+
+Confirm argent is available:
+
+1. Are `mcp__argent__*` tools in your tool list? If none are present, argent is not available.
+2. If still unsure, run `command -v argent`. A non-zero exit means the CLI is not on PATH.
+
+If argent IS available, ignore the rest of this block and follow this rule normally.
+
+If argent is ABSENT, treat it as an expected state, not an error to retry. Do not call `mcp__argent__*` tools, do not run `argent` commands, and do not attempt any argent workflow. Tell the user once, and ask if you should continue without argent:
+
+> Argent isn't installed in this environment. To enable the mobile/Chromium tooling this repo is configured for, run `npx @swmansion/argent init -y` (or `npm i -g @swmansion/argent && argent init -y`).
+> </availability_check>
 
 <tapping_rule>
 <important>**Never** derive tap coordinates from a screenshot</important>
@@ -44,7 +60,7 @@ Before booting, running, or interacting with any app, call `list-devices` first 
 Decision order:
 
 1. **Explicit user intent** - choose the user named platform or device. Look for words "simulator" and "emulator".
-2. **Prefer a running device.** iOS simulators - state `Booted` and Android devices - `state: "device"` come first in `list-devices`.
+2. **Prefer a running device.** iOS simulators - state `Booted` and Android devices - `state: "device"` come first in `list-devices`; Chromium (CDP) apps appear as `platform: "chromium"`, `state: "Running"`.
 3. **Single-platform project:** (per `argent-environment-inspector` flags `is_native_ios`/`is_native_android`, or RN with only one platform configured) → boot that platform.
    </device_selection_rule>
 
@@ -128,6 +144,11 @@ RECORDING & REPLAYING FLOWS
 Use skill: `argent-create-flow`
 When: A multi-step interaction sequence needs to be repeated — re-profiling after a fix, A/B comparisons, regression checks, user says "again" / "run that flow", or you worked through a complex path worth saving. Also use proactively: if you are about to repeat steps you already performed, record first, then replay.
 Prompt keywords: flow, repeat, test X times
+
+PROPOSING DESIGN VARIANTS FOR HUMAN SELECTION
+Use skill: `argent-lens`
+When: The user asks for design alternatives / options / A-B choices for a screen or component, or you have produced more than one candidate look for an element and want a human to pick before committing. Covers the build → navigate → screenshot → propose_variant loop and the single blocking await_user_selection call. (Gated behind the `argent-lens` flag, off by default — run `argent enable argent-lens` first.)
+Prompt keywords: variant, design option, alternative, A/B, "let me pick", "show me options"
 </skill_routing>
 
 <subagents>
