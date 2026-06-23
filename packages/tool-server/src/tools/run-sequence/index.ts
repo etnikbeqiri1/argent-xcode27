@@ -18,6 +18,7 @@ const ALLOWED_TOOLS = new Set([
   "button",
   "keyboard",
   "rotate",
+  "wait",
 ]);
 
 const zodSchema = z.object({
@@ -32,7 +33,7 @@ const zodSchema = z.object({
         tool: z
           .string()
           .describe(
-            "Tool name — one of: gesture-tap, gesture-swipe, gesture-scroll, gesture-drag, gesture-custom, gesture-pinch, gesture-rotate, button, keyboard, rotate"
+            "Tool name — one of: gesture-tap, gesture-swipe, gesture-scroll, gesture-drag, gesture-custom, gesture-pinch, gesture-rotate, button, keyboard, rotate, wait"
           ),
         args: z
           .record(z.string(), z.unknown())
@@ -97,6 +98,7 @@ Allowed tools and their args (udid is auto-injected, do NOT include it in args):
   button:         { button: "home"|"back"|"power"|"volumeUp"|"volumeDown"|"appSwitch"|"actionButton" }                  [ios/android]
   keyboard:       { text?: string, key?: string, delayMs?: number }                                                     [ios/android/chromium]
   rotate:         { orientation: "Portrait"|"LandscapeLeft"|"LandscapeRight"|"PortraitUpsideDown" }                     [ios/android]
+  wait:           { condition: "time"|"exists"|"visible"|"hidden"|"text", durationMs?, selector?: {text?,identifier?,role?}, expectedText?, timeoutMs?, pollIntervalMs? }  [ios/android/chromium]
 
 Example — scroll down three times (use gesture-scroll with positive deltaY on Chromium):
   { "udid": "<UDID>", "steps": [
@@ -109,6 +111,13 @@ Example — type text and submit:
   { "udid": "<UDID>", "steps": [
     { "tool": "keyboard", "args": { "text": "hello world" } },
     { "tool": "keyboard", "args": { "key": "enter" } }
+  ]}
+
+Example — tap, wait for the next screen's element, then tap it:
+  { "udid": "<UDID>", "steps": [
+    { "tool": "gesture-tap", "args": { "x": 0.5, "y": 0.9 } },
+    { "tool": "wait", "args": { "condition": "visible", "selector": { "text": "Continue" } } },
+    { "tool": "gesture-tap", "args": { "x": 0.5, "y": 0.5 } }
   ]}
 
 Stops on the first error and returns partial results.`,
