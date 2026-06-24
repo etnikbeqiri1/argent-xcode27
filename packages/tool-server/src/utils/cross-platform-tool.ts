@@ -58,6 +58,7 @@ export function dispatchByPlatform<
   Params extends { udid: string },
   Result,
   ChromiumServices = Record<string, unknown>,
+  VegaServices = unknown,
   IosRemoteServices = IosServices,
 >(opts: {
   toolId: string;
@@ -72,6 +73,13 @@ export function dispatchByPlatform<
    */
   iosRemote?: PlatformImpl<IosRemoteServices, Params, Result>;
   chromium?: PlatformImpl<ChromiumServices, Params, Result>;
+  /**
+   * Vega (Fire TV) branch. Optional so existing iOS/Android-only tools compile
+   * unchanged. When a tool's capability declares `vega` support but no `vega`
+   * branch is wired here, a Vega device dispatch throws
+   * `NotImplementedOnPlatformError` (501) rather than silently falling through.
+   */
+  vega?: PlatformImpl<VegaServices, Params, Result>;
 }): (
   services: Record<string, unknown>,
   params: Params,
@@ -113,6 +121,15 @@ export function dispatchByPlatform<
         device,
         invokeOptions
       );
+    }
+    if (device.platform === "vega") {
+      if (!opts.vega) {
+        throw new NotImplementedOnPlatformError({ toolId: opts.toolId, platform: "vega" });
+      }
+      if (opts.vega.requires?.length) {
+        await ensureDeps(opts.vega.requires);
+      }
+      return opts.vega.handler(services as unknown as VegaServices, params, device, invokeOptions);
     }
     // chromium
     if (!opts.chromium) {
