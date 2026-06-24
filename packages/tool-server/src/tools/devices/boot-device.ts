@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { existsSync, mkdirSync, symlinkSync } from "node:fs";
 import { promisify } from "node:util";
 import { z } from "zod";
 import {
@@ -428,6 +429,23 @@ async function listNewEmulatorSerials(before: Set<string>): Promise<string[]> {
   return now.filter((s) => !before.has(s));
 }
 
+/**
+ * Xcode 27+ moved SimulatorKit.framework from Developer/Library/PrivateFrameworks
+ * to SharedFrameworks. The simulator-server binary looks for it at the old path.
+ * Create a symlink so it can find it regardless of Xcode version.
+ */
+function ensureSimulatorKitPath(): void {
+  const xcodePaths = ["/Applications/Xcode.app", "/Applications/Xcode-beta.app"];
+  for (const xcodePath of xcodePaths) {
+    const newPath = `${xcodePath}/Contents/SharedFrameworks/SimulatorKit.framework`;
+    const oldPath = `${xcodePath}/Contents/Developer/Library/PrivateFrameworks/SimulatorKit.framework`;
+    if (existsSync(newPath) && !existsSync(oldPath)) {
+      mkdirSync(`${xcodePath}/Contents/Developer/Library/PrivateFrameworks`, { recursive: true });
+      symlinkSync(newPath, oldPath);
+    }
+  }
+}
+
 async function bootIos(
   udid: string,
   registry: Registry,
@@ -448,6 +466,7 @@ async function bootIos(
     );
   }
   await ensureDep("xcrun");
+  ensureSimulatorKitPath();
 
   const simState = await listIosSimulators()
     .then((sims) => sims.find((s) => s.udid === udid)?.state)
@@ -501,8 +520,14 @@ async function bootIos(
     "com.apple.iphonesimulator",
     "CurrentDeviceUDID",
     udid,
-  ]);
-  await execFileAsync("open", ["-a", "Simulator.app"]);
+  ]).catch(() => {});
+  try {
+    await execFileAsync("open", ["-a", "Simulator.app"]);
+  } catch {
+    try {
+      await execFileAsync("open", ["-b", "com.apple.dt.Devices"]);
+    } catch {}
+  }
   return { platform: "ios", udid, booted: true };
 }
 
