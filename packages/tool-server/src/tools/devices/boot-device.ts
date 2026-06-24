@@ -35,7 +35,6 @@ import {
   simctlBootstatus as simRemoteBootstatus,
   simctlListDevices as simRemoteListDevices,
   simctlShutdown as simRemoteShutdown,
-  setupAccessibilityDefaults as simRemoteSetupAccessibilityDefaults,
 } from "../../utils/sim-remote";
 import { bootElectronApp, type ElectronBootResult } from "./boot-electron";
 
@@ -508,11 +507,11 @@ async function bootIos(
  * Boot a remote iOS simulator through `sim-remote`. Mirrors `bootIos` but:
  *
  * - Uses `sim-remote simctl` for boot/shutdown/bootstatus (no local xcrun).
- * - Applies accessibility defaults via the orchestrator's
- *   `sim-remote setup accessibility-defaults` rather than the host pre-boot
- *   plist write (we have no filesystem access to the remote sim).
  * - Pre-warms the native-devtools blueprint so the dylib injection env is
- *   set inside the remote sim before the app launches.
+ *   set inside the remote sim before the app launches. Accessibility defaults
+ *   are applied lazily by the ax-service blueprint's `bootstrapAx` (which runs
+ *   the `defaults write` through the orchestrator's generic spawn) before the
+ *   first describe-driven tool — we have no filesystem access to the remote sim.
  */
 async function bootIosRemote(
   id: string,
@@ -551,10 +550,6 @@ async function bootIosRemote(
     if (!/Booted/i.test(err.message)) throw err;
   });
   await simRemoteBootstatus(id, { boot: true });
-
-  // Idempotent: re-applies the three AX defaults every boot in case the
-  // orchestrator's simulator was wiped between sessions.
-  await simRemoteSetupAccessibilityDefaults(id).catch(() => undefined);
 
   const ndRef = nativeDevtoolsRef({ id, platform: "ios-remote", kind: "simulator" });
   const ndApi = await registry.resolveService<NativeDevtoolsApi>(ndRef.urn, ndRef.options);

@@ -128,47 +128,75 @@ export async function simctlPbpaste(udid: string): Promise<string> {
   return stdout;
 }
 
-// ── setup ──
+// ── generic in-simulator primitives ──
 
-export async function setupAccessibilityDefaults(udid: string): Promise<void> {
-  await run(["setup", "accessibility-defaults", stripRemotePrefix(udid)]);
-}
-
-export async function setupNativeDevtools(
-  udid: string,
-  opts: { libs: string[]; cdpPort: number }
-): Promise<void> {
-  const args = ["setup", "native-devtools"];
-  for (const lib of opts.libs) args.push("--lib", lib);
-  args.push("--cdp-port", String(opts.cdpPort), stripRemotePrefix(udid));
-  await run(args);
+export interface SpawnResult {
+  /** Set when spawned detached. */
+  pid?: number;
+  /** Set when run to completion (non-detached). */
+  exitCode?: number;
+  stdout: string;
+  stderr: string;
 }
 
 /**
- * Returns the bundle ids of UIKitApplications currently running on the
- * remote simulator (orchestrator-side `setup running-bundle-ids`).
+ * Run `simctl spawn` on the remote simulator. With `binPath`, the binary is
+ * uploaded and run as argv[0] with `args` appended; otherwise `args` is the
+ * full in-simulator argv (e.g. `["launchctl", "list"]`). `detach` leaves the
+ * process running and returns its pid instead of waiting.
  */
-export async function setupRunningBundleIds(udid: string): Promise<string[]> {
-  const { stdout } = await run(["setup", "running-bundle-ids", stripRemotePrefix(udid)]);
-  return stdout
-    .split("\n")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
+export async function simctlSpawn(
+  udid: string,
+  opts: { binPath?: string; args?: string[]; detach?: boolean }
+): Promise<SpawnResult> {
+  const cmd = ["spawn", stripRemotePrefix(udid)];
+  if (opts.binPath) cmd.push("--bin", opts.binPath);
+  if (opts.detach) cmd.push("--detach");
+  const args = opts.args ?? [];
+  if (args.length > 0) cmd.push("--", ...args);
+  // Uploading a binary can take a moment; allow more than the default.
+  const { stdout } = await run(cmd, { timeoutMs: 60_000 });
+  try {
+    const parsed = JSON.parse(stdout) as {
+      pid?: number | null;
+      exit_code?: number | null;
+      stdout?: string | null;
+      stderr?: string | null;
+    };
+    return {
+      pid: parsed.pid ?? undefined,
+      exitCode: parsed.exit_code ?? undefined,
+      stdout: parsed.stdout ?? "",
+      stderr: parsed.stderr ?? "",
+    };
+  } catch (err) {
+    throw new Error(`sim-remote spawn returned non-JSON output: ${(err as Error).message}`, {
+      cause: err,
+    });
+  }
 }
 
-export async function setupAxService(
+/**
+ * Upload a dylib to the remote simulator. With `insert`, it is added to
+ * `DYLD_INSERT_LIBRARIES`; otherwise it is only staged (co-located so a primary
+ * dylib can `@loader_path`-resolve it).
+ */
+export async function injectDylib(
   udid: string,
-  opts: { port: number; timeoutSecs?: number }
+  opts: { filePath: string; insert?: boolean }
 ): Promise<void> {
-  await run([
-    "setup",
-    "ax-service",
-    "--port",
-    String(opts.port),
-    "--timeout-secs",
-    String(opts.timeoutSecs ?? 3600),
-    stripRemotePrefix(udid),
-  ]);
+  const args = ["dylib", "add", stripRemotePrefix(udid), opts.filePath];
+  if (opts.insert) args.push("--insert");
+  await run(args, { timeoutMs: 60_000 });
+}
+
+export async function removeDylib(udid: string, filename: string): Promise<void> {
+  await run(["dylib", "remove", stripRemotePrefix(udid), filename]);
+}
+
+/** Set a launchd environment variable inside the remote simulator. */
+export async function setSimulatorEnv(udid: string, key: string, value: string): Promise<void> {
+  await run(["setenv", stripRemotePrefix(udid), key, value]);
 }
 
 // ── proxy ──
